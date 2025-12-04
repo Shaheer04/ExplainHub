@@ -11,6 +11,8 @@ interface ExplanationContextType {
   explanations: Record<string, Explanation>;
   generating: boolean;
   error: string | null;
+  architectureDiagram: string | null;
+  setArchitectureDiagram: (diagram: string | null) => void;
   generateExplanation: (item: GitHubFile, content?: string) => Promise<void>;
   generateQuestionResponse: (question: string, filePath: string, fileContent: string) => Promise<void>;
 }
@@ -35,6 +37,7 @@ export const ExplanationProvider: React.FC<ExplanationProviderProps> = ({ childr
   const [explanations, setExplanations] = useState<Record<string, Explanation>>({});
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [architectureDiagram, setArchitectureDiagram] = useState<string | null>(null);
 
 
   const generateExplanation = async (item: GitHubFile, content?: string) => {
@@ -53,7 +56,6 @@ export const ExplanationProvider: React.FC<ExplanationProviderProps> = ({ childr
         explanation = await generateDirectoryExplanation(item.path, [], repoName, apiKey);
       } else {
         if (content) {
-          // Start timing for performance monitoring
           const startTime = Date.now();
           explanation = await generateFileExplanation(item.path, content, repoName, apiKey);
           const duration = Date.now() - startTime;
@@ -91,7 +93,6 @@ export const ExplanationProvider: React.FC<ExplanationProviderProps> = ({ childr
       const duration = Date.now() - startTime;
       console.log(`Question response generated in ${duration}ms`);
 
-      // Store question response separately or with a special key
       const questionKey = `${filePath}_question_${Date.now()}`;
       setExplanations(prev => ({
         ...prev,
@@ -109,6 +110,8 @@ export const ExplanationProvider: React.FC<ExplanationProviderProps> = ({ childr
     explanations,
     generating,
     error,
+    architectureDiagram,
+    setArchitectureDiagram,
     generateExplanation,
     generateQuestionResponse
   };

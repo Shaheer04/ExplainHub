@@ -77,8 +77,8 @@ const FileTreeItem: React.FC<FileTreeItemProps> = ({
   return (
     <div>
       <div
-        className={`flex items-center py-2.5 px-3 cursor-pointer hover:bg-blue-50 transition-all duration-150 relative group ${
-          isSelected ? 'bg-blue-50 border-l-3 border-blue-500 shadow-sm' : 'hover:border-l-3 hover:border-blue-200'
+        className={`flex items-center py-2.5 px-3 cursor-pointer hover:bg-github-dark-bg-secondary transition-all duration-150 relative group ${
+          isSelected ? 'bg-github-dark-bg-secondary border-l-3 border-blue-500 shadow-sm' : 'hover:border-l-3 hover:border-blue-400'
         }`}
         onClick={handleClick}
         style={{ paddingLeft: `${(level * 16) + 12}px` }}
@@ -86,7 +86,7 @@ const FileTreeItem: React.FC<FileTreeItemProps> = ({
         <span className="mr-2.5 text-base flex-shrink-0 transition-transform group-hover:scale-110">
           {getIcon(file)}
         </span>
-        <span className={`text-sm truncate flex-1 ${isSelected ? 'font-medium text-blue-700' : 'text-gray-700 group-hover:text-gray-900'}`}>
+        <span className={`text-sm truncate flex-1 ${isSelected ? 'font-medium text-blue-400' : 'text-github-dark-text group-hover:text-github-dark-text'}`}>
           {file.name}
         </span>
         {isLoading && (
@@ -118,7 +118,7 @@ const FileTreeItem: React.FC<FileTreeItemProps> = ({
 
       {file.type === 'dir' && isExpanded && children.length === 0 && !isLoading && (
         <div
-          className="text-xs text-gray-400 italic py-2 flex items-center"
+          className="text-xs text-github-dark-text-secondary italic py-2 flex items-center"
           style={{ paddingLeft: `${(level + 1) * 16 + 12}px` }}
         >
           <span className="mr-1">∅</span>

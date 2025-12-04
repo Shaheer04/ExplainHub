@@ -16,7 +16,7 @@ export interface GitHubRepo {
   files: GitHubFile[];
 }
 
-export const fetchGitHubRepo = async (repoUrl: string): Promise<GitHubRepo> => {
+export const fetchGitHubRepo = async (repoUrl: string, githubToken?: string): Promise<GitHubRepo> => {
   // Extract owner and repo name from URL
   const regex = /github\.com\/([^\/]+)\/([^\/]+)/;
   const match = repoUrl.match(regex);
@@ -27,10 +27,19 @@ export const fetchGitHubRepo = async (repoUrl: string): Promise<GitHubRepo> => {
   
   const [, owner, repo] = match;
   
+  // Prepare headers with optional token
+  const headers: HeadersInit = {};
+  if (githubToken) {
+    headers['Authorization'] = `token ${githubToken}`;
+  }
+  
   // Fetch repository contents
-  const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents`);
+  const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents`, { headers });
   
   if (!response.ok) {
+    if (response.status === 403) {
+      throw new Error('GitHub API rate limit exceeded. Please add a GitHub token or wait an hour.');
+    }
     throw new Error(`Failed to fetch repository: ${response.statusText}`);
   }
   
@@ -55,8 +64,13 @@ export const fetchGitHubRepo = async (repoUrl: string): Promise<GitHubRepo> => {
   };
 };
 
-export const fetchGitHubDirContents = async (owner: string, repo: string, path: string): Promise<GitHubFile[]> => {
-  const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`);
+export const fetchGitHubDirContents = async (owner: string, repo: string, path: string, githubToken?: string): Promise<GitHubFile[]> => {
+  const headers: HeadersInit = {};
+  if (githubToken) {
+    headers['Authorization'] = `token ${githubToken}`;
+  }
+  
+  const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`, { headers });
   
   if (!response.ok) {
     throw new Error(`Failed to fetch directory contents: ${response.statusText}`);
@@ -84,3 +98,109 @@ export const fetchGitHubFileContent = async (downloadUrl: string): Promise<strin
   
   return await response.text();
 };
+
+export const fetchCompleteRepoStructure = async (
+  owner: string,
+  repo: string,
+  path: string = '',
+  maxDepth: number = 3,
+  currentDepth: number = 0,
+  githubToken?: string
+): Promise<any> => {
+  if (currentDepth >= maxDepth) {
+    return { name: path.split('/').pop() || repo, type: 'dir', children: [] };
+  }
+
+  try {
+    const headers: HeadersInit = {};
+    if (githubToken) {
+      headers['Authorization'] = `token ${githubToken}`;
+    }
+    
+    // Add a small delay to avoid rate limiting
+    if (currentDepth > 0) {
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
+    
+    const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`, { headers });
+    
+    if (!response.ok) {
+      if (response.status === 429) {
+        console.warn('Rate limit hit, waiting before retry...');
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        // Retry once
+        const retryResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`, { headers });
+        if (!retryResponse.ok) {
+          console.warn(`Failed to fetch ${path}: ${retryResponse.statusText}`);
+          return null;
+        }
+        const retryData = await retryResponse.json();
+        if (Array.isArray(retryData)) {
+          return processDataArray(retryData, owner, repo, path, maxDepth, currentDepth, githubToken);
+        }
+        return null;
+      }
+      console.warn(`Failed to fetch ${path}: ${response.statusText}`);
+      return null;
+    }
+    
+    const data = await response.json();
+    
+    if (Array.isArray(data)) {
+      return processDataArray(data, owner, repo, path, maxDepth, currentDepth, githubToken);
+    }
+    
+    return null;
+  } catch (error) {
+    console.error(`Error fetching structure for ${path}:`, error);
+    return null;
+  }
+};
+
+// Helper function to process data array with batching
+async function processDataArray(
+  data: any[],
+  owner: string,
+  repo: string,
+  path: string,
+  maxDepth: number,
+  currentDepth: number,
+  githubToken?: string
+): Promise<any> {
+  // Process items in smaller batches to avoid rate limiting
+  const batchSize = 3;
+  const structure: any[] = [];
+  
+  for (let i = 0; i < data.length; i += batchSize) {
+    const batch = data.slice(i, i + batchSize);
+    const batchResults = await Promise.all(
+      batch.map(async (item: any) => {
+        if (item.type === 'dir') {
+          // Recursively fetch subdirectories
+          const children = await fetchCompleteRepoStructure(owner, repo, item.path, maxDepth, currentDepth + 1, githubToken);
+          return {
+            name: item.name,
+            type: 'dir',
+            path: item.path,
+            children: children?.children || []
+          };
+        } else {
+          return {
+            name: item.name,
+            type: 'file',
+            path: item.path,
+            size: item.size
+          };
+        }
+      })
+    );
+    structure.push(...batchResults);
+  }
+  
+  return {
+    name: path.split('/').pop() || repo,
+    type: 'dir',
+    path: path,
+    children: structure.filter(Boolean)
+  };
+}

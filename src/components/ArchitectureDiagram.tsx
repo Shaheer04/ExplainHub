@@ -10,7 +10,7 @@ interface ArchitectureDiagramProps {
 }
 
 const ArchitectureDiagram: React.FC<ArchitectureDiagramProps> = ({ apiKey }) => {
-  const { repo, githubToken } = useRepo();
+  const { repo } = useRepo();
   const { architectureDiagram, setArchitectureDiagram } = useExplanations();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -48,7 +48,7 @@ const ArchitectureDiagram: React.FC<ArchitectureDiagramProps> = ({ apiKey }) => 
     try {
       // Fetch complete repo structure
       console.log('ArchitectureDiagram: Fetching repo structure...');
-      const structure = await fetchCompleteRepoStructure(repo.owner, repo.name, '', 3, 0, githubToken);
+      const structure = await fetchCompleteRepoStructure(repo.owner, repo.name, '', 3, 0);
       
       console.log('ArchitectureDiagram: Structure fetched:', structure);
       
@@ -221,7 +221,6 @@ const ArchitectureDiagram: React.FC<ArchitectureDiagramProps> = ({ apiKey }) => 
                   onClick={() => {
                     console.log('API Key present:', !!apiKey);
                     console.log('Repo:', repo);
-                    console.log('GitHub Token present:', !!githubToken);
                   }}
                   className="px-4 py-2 bg-github-dark-bg-secondary hover:bg-github-dark-bg-tertiary text-white text-sm font-medium rounded transition-colors"
                 >

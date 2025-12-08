@@ -7,9 +7,8 @@ interface RepoContextType {
   fileContents: Record<string, string>;
   loading: boolean;
   error: string | null;
-  githubToken?: string;
   setSelectedFile: (file: GitHubFile | null) => void;
-  fetchRepo: (url: string, token?: string) => Promise<void>;
+  fetchRepo: (url: string) => Promise<void>;
   fetchFileContent: (file: GitHubFile) => Promise<void>;
   fetchDirectoryContents: (dir: GitHubFile) => Promise<GitHubFile[]>;
 }
@@ -34,14 +33,12 @@ export const RepoProvider: React.FC<RepoProviderProps> = ({ children }) => {
   const [fileContents, setFileContents] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [githubToken, setGithubToken] = useState<string | undefined>();
 
-  const fetchRepo = async (url: string, token?: string) => {
+  const fetchRepo = async (url: string) => {
     setLoading(true);
     setError(null);
-    setGithubToken(token);
     try {
-      const repoData = await fetchGitHubRepo(url, token);
+      const repoData = await fetchGitHubRepo(url);
       setRepo(repoData);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred while fetching the repository');
@@ -80,7 +77,7 @@ export const RepoProvider: React.FC<RepoProviderProps> = ({ children }) => {
       // Make sure we're using the correct path format for the API
       const path = dir.path.startsWith('/') ? dir.path.substring(1) : dir.path;
       console.log('RepoContext: Fetching directory contents for:', path);
-      const contents = await fetchGitHubDirContents(repo.owner, repo.name, path, githubToken);
+      const contents = await fetchGitHubDirContents(repo.owner, repo.name, path);
       console.log('RepoContext: Received', contents.length, 'items');
       return contents;
     } catch (err) {
@@ -96,7 +93,6 @@ export const RepoProvider: React.FC<RepoProviderProps> = ({ children }) => {
     fileContents,
     loading,
     error,
-    githubToken,
     setSelectedFile,
     fetchRepo,
     fetchFileContent,

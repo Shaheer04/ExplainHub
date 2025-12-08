@@ -1,5 +1,5 @@
-import React, { useState, useMemo, useCallback } from 'react';
-import { generateFunctionExplanation } from '../services/geminiApi';
+import React, { useState, useMemo, useCallback, useEffect } from 'react';
+import { generateBatchFunctionExplanations } from '../services/geminiApi';
 import { useRepo } from '../contexts/RepoContext';
 
 interface CodeViewerProps {
@@ -22,7 +22,7 @@ interface FunctionInfo {
 const CodeViewer: React.FC<CodeViewerProps> = ({ fileName, filePath, content, apiKey }) => {
   const [hoveredFunction, setHoveredFunction] = useState<string | null>(null);
   const [functionExplanations, setFunctionExplanations] = useState<Record<string, string>>({});
-  const [loadingExplanations, setLoadingExplanations] = useState<Record<string, boolean>>({});
+  const [loadingBatch, setLoadingBatch] = useState(false);
   const { repo, fetchFileContent } = useRepo();
 
   // Extract function code from lines starting at given index
@@ -245,32 +245,41 @@ const CodeViewer: React.FC<CodeViewerProps> = ({ fileName, filePath, content, ap
   console.log('CodeViewer - Local functions:', localFunctions.length);
   console.log('CodeViewer - Imported functions:', importedFunctions.length);
 
-  // Get AI explanation for a function
-  const getFunctionExplanation = useCallback(async (func: FunctionInfo) => {
-    if (func.isImported || !func.code) return;
-    if (functionExplanations[func.name]) return;
-    if (loadingExplanations[func.name]) return;
+  // Batch load all function explanations on mount
+  useEffect(() => {
+    const loadAllExplanations = async () => {
+      if (localFunctions.length === 0) return;
+      if (Object.keys(functionExplanations).length > 0) return;
+      if (loadingBatch) return;
 
-    setLoadingExplanations(prev => ({ ...prev, [func.name]: true }));
+      setLoadingBatch(true);
 
-    try {
-      const explanation = await generateFunctionExplanation(func.name, func.code, apiKey);
-      setFunctionExplanations(prev => ({ ...prev, [func.name]: explanation }));
-    } catch (error) {
-      console.error('Failed to generate function explanation:', error);
-      setFunctionExplanations(prev => ({ ...prev, [func.name]: 'Failed to load explanation' }));
-    } finally {
-      setLoadingExplanations(prev => ({ ...prev, [func.name]: false }));
-    }
-  }, [apiKey, functionExplanations, loadingExplanations]);
+      try {
+        const functionsToExplain = localFunctions
+          .filter(f => f.code)
+          .map(f => ({ name: f.name, code: f.code! }));
+
+        if (functionsToExplain.length > 0) {
+          console.log('Loading explanations for', functionsToExplain.length, 'functions in batch...');
+          const explanations = await generateBatchFunctionExplanations(functionsToExplain, apiKey);
+          setFunctionExplanations(explanations);
+          console.log('Batch explanations loaded successfully');
+        }
+      } catch (error) {
+        console.error('Failed to generate batch function explanations:', error);
+      } finally {
+        setLoadingBatch(false);
+      }
+    };
+
+    loadAllExplanations();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localFunctions.length, apiKey]);
 
   // Handle function hover
   const handleFunctionHover = useCallback((func: FunctionInfo) => {
     setHoveredFunction(func.name);
-    if (!func.isImported && func.code && !functionExplanations[func.name]) {
-      getFunctionExplanation(func);
-    }
-  }, [functionExplanations, getFunctionExplanation]);
+  }, []);
 
   // Handle imported function click to navigate to file
   const handleImportedFunctionClick = useCallback(async (func: FunctionInfo) => {
@@ -408,10 +417,10 @@ const CodeViewer: React.FC<CodeViewerProps> = ({ fileName, filePath, content, ap
                     {hoveredFunction === func.name && (
                       <div className="absolute z-50 left-0 top-full mt-2 px-4 py-3 bg-github-dark-bg border border-github-dark-border rounded-lg shadow-xl text-xs text-github-dark-text whitespace-normal w-80 max-w-md">
                         <div className="font-semibold text-blue-400 mb-2">{func.name}()</div>
-                        {loadingExplanations[func.name] ? (
+                        {loadingBatch ? (
                           <div className="flex items-center gap-2 text-github-dark-text-secondary">
                             <div className="animate-spin w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full"></div>
-                            <span>Loading explanation...</span>
+                            <span>Loading explanations...</span>
                           </div>
                         ) : functionExplanations[func.name] ? (
                           <div className="text-github-dark-text">{functionExplanations[func.name]}</div>

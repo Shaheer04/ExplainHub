@@ -1,17 +1,50 @@
+import { cacheService } from './cacheService';
+import { generateLocalArchitecture } from './fallbackGenerator';
+import { ArchitectureData, CodebaseAnalysis } from '../types/architecture';
 
-// Rate limiting helper
-let lastGeminiCallTime = 0;
-const MIN_CALL_INTERVAL = 1000; // 1 second between calls
+// Queue-based Rate Limiter to prevent bursts and ensuring serial execution
+class RateLimiter {
+  private queue: Promise<void> = Promise.resolve();
+  private lastCallTime = 0;
+  // Free tier is ~15 RPM, which is 1 request every 4 seconds.
+  // We'll set it to 2 seconds to allow *some* speed but rely on backoff if we hit limits,
+  // or 4 seconds to be super safe. Let's go with 2000ms + random jitter to avoid lockstep.
+  // Actually, user is hitting 429s easily. Let's try 3.5s to be safe for free tier.
+  private readonly MIN_INTERVAL = 3500;
 
-async function waitForRateLimit() {
-  const now = Date.now();
-  const timeSinceLastCall = now - lastGeminiCallTime;
-  if (timeSinceLastCall < MIN_CALL_INTERVAL) {
-    const waitTime = MIN_CALL_INTERVAL - timeSinceLastCall;
-    console.log(`⏳ Rate limiting: waiting ${waitTime}ms...`);
-    await new Promise(resolve => setTimeout(resolve, waitTime));
+  async schedule<T>(fn: () => Promise<T>): Promise<T> {
+    const operation = this.queue.then(async () => {
+      const now = Date.now();
+      const timeSinceLast = now - this.lastCallTime;
+
+      if (timeSinceLast < this.MIN_INTERVAL) {
+        const wait = this.MIN_INTERVAL - timeSinceLast;
+        console.log(`⏳ Rate Limiter: Waiting ${wait}ms...`);
+        await new Promise(resolve => setTimeout(resolve, wait));
+      }
+
+      try {
+        this.lastCallTime = Date.now();
+        return await fn();
+      } catch (error) {
+        throw error;
+      }
+    });
+
+    // Update queue to wait for this operation (catch errors so queue doesn't stall)
+    // We use then() ensuring it returns Promise<void>
+    this.queue = operation.then(() => { }, () => { });
+
+    return operation;
   }
-  lastGeminiCallTime = Date.now();
+}
+
+export const rateLimiter = new RateLimiter();
+
+// Deprecated: old helper, mapped to new system for backward compatibility if needed, 
+// but we will replace usages.
+async function waitForRateLimit() {
+  // No-op in favor of wrapping calls in rateLimiter.schedule
 }
 
 export interface Explanation {
@@ -252,8 +285,18 @@ export const generateArchitectureDiagram = async (
   repoStructure: any,
   apiKey: string
 ): Promise<string> => {
+  // 1. Check Cache
+  const cacheKey = cacheService.generateKey(repoName, 'root', 'diagram');
+  const cachedDiagram = cacheService.get<string>(cacheKey);
+
+  if (cachedDiagram) {
+    console.log('✨ Using cached architecture diagram');
+    return cachedDiagram;
+  }
+
   // CONFIGURATION: Token budget management
   const MAX_TREE_DEPTH = 3;
+
   const MAX_CHILDREN_PER_DIR = 20;
 
   /**
@@ -307,145 +350,220 @@ export const generateArchitectureDiagram = async (
   const dirCount = JSON.stringify(repoStructure).match(/"type":"dir"/g)?.length || 0;
 
   const prompt = `You are a Senior Software Architect. Analyze the codebase structure and generate a tailored Technical Architecture Diagram in JSON format.
-
-CONTEXT:
-- Repository: ${repoName}
-- Files: ~${fileCount} | Directories: ~${dirCount}
-
-FILE STRUCTURE (TreeMap):
-\`\`\`
-${treeStructure}
-\`\`\`
-
-INSTRUCTIONS:
-1. **Analyze** the structure to identify architectural patterns (MVC, Microservices, Monolith, Clean Arch).
-2. **Infer** logical components from naming conventions (e.g., 'auth-controller' -> 'API/Auth', 'users-db' -> 'Data/Users').
-3. **Group** components into meaningful layers/modules (e.g., 'Frontend', 'Backend API', 'Database Layer').
-4. **Define** relationships to show data flow (e.g., UI -> API -> Service -> DB).
-
-OUTPUT FORMAT:
-Return ONLY a valid JSON object matching this TypeScript interface:
-
-\`\`\`typescript
-interface DiagramData {
-  // Logical groupings (subgraphs)
-  modules: {
-    id: string;       // unique alphanumeric id, e.g., "backend_api"
-    label: string;    // display name, e.g., "Backend API"
-    components: {
-      id: string;     // unique alphanumeric id, e.g., "auth_controller"
-      label: string;  // display name, e.g., "Auth Controller"
+  
+  CONTEXT:
+  - Repository: ${repoName}
+  - Files: ~${fileCount} | Directories: ~${dirCount}
+  
+  FILE STRUCTURE (TreeMap):
+  \`\`\`
+  ${treeStructure}
+  \`\`\`
+  
+  INSTRUCTIONS:
+  1. **Concept over Files**: Do NOT list every file. Group them into logical "Functional Blocks" (e.g., instead of listing auth.ts, user.ts, session.ts -> create one node "Auth Module").
+  2. **Technical Depth**: Identify patterns (MVC, Hexagonal, Clean Arch). Use proper technical names (e.g., "REST API Controller", "PostgreSQL Adapter", "React Router").
+  3. **Relationships**: Show data flow (solid lines) and dependencies (dotted lines).
+  4. **Status Indicator**: You MUST include a special unconnected subgraph labeled "Status" containing a single node "AI_GEN" with label "✨ AI Generated Architecture".
+  
+  OUTPUT FORMAT:
+  Return ONLY a valid JSON object matching this TypeScript interface:
+  
+  \`\`\`typescript
+  interface DiagramData {
+    modules: {
+      id: string;       // e.g., "backend_api"
+      label: string;    // e.g., "Backend API"
+      components: {
+        id: string;     // e.g., "auth_controller"
+        label: string;  // e.g., "Auth Controller"
+      }[];
     }[];
-  }[];
-  // Connections between components
-  relationships: {
-    from: string;     // component id
-    to: string;       // component id
-    type: 'solid' | 'dotted'; // solid = flow/call, dotted = dependency/reference
-    label?: string;   // optional edge label
-  }[];
-}
-\`\`\`
-
-CONSTRAINTS:
-- IDs must be alphanumeric using underscores (no spaces/dashes).
-- Keep it high-level: 15-25 nodes maximum.
-- Do NOT output Mermaid code directly. Output strictly JSON.
-- Ensure 'from' and 'to' in relationships match defined component IDs.
-
-GENERATE JSON NOW:`;
+    relationships: {
+      from: string;
+      to: string;
+      type: 'solid' | 'dotted';
+      label?: string;
+    }[];
+  }
+  \`\`\`
+  
+  CONSTRAINTS:
+  - IDs must be alphanumeric using underscores.
+  - Max 20 nodes total (keep it high-level).
+  - IMPORTANT: Include the "Status" module with "AI_GEN" component as requested.
+  - Do NOT output Mermaid code directly. Output strictly JSON.
+  
+  GENERATE JSON NOW:`;
 
   console.log('Architecture diagram - JSON Prompt length:', prompt.length);
 
-  // Apply global rate limiting
-  await waitForRateLimit();
+  // Wrap in queue
+  return rateLimiter.schedule(async () => {
+    // Retry logic
+    const maxRetries = 3;
+    let lastError: any = null;
 
-  // Retry logic
-  const maxRetries = 3;
-  let lastError: any = null;
-
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      if (attempt > 0) {
-        // Default backoff
-        let waitTime = Math.pow(2, attempt) * 2000; // Increased to 2s base
-        console.log(`Retry attempt ${attempt + 1}/${maxRetries} for JSON generation...`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-      }
-
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, { // Using 2.0 Flash as in callGeminiAPI
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.2,
-            maxOutputTokens: 2000,
-            topK: 40,
-            topP: 0.8,
-            responseMimeType: "application/json" // Force JSON output
-          }
-        })
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-
-        // Handle Rate Limits specifically
-        if (response.status === 429) {
-          const retryAfter = response.headers.get('Retry-After');
-          const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt + 2) * 1000;
-
-          console.error('🚨 Gemini API Rate Limit Hit during Diagram Generation!');
-          console.warn(`Waiting ${Math.ceil(waitTime / 1000)}s before retry...`);
-
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          // Default backoff - wait inside the queue slot
+          let waitTime = Math.pow(2, attempt) * 2000;
+          console.log(`Retry attempt ${attempt + 1}/${maxRetries} for JSON generation...`);
           await new Promise(resolve => setTimeout(resolve, waitTime));
-          // Don't count this as a normal attempt if we waited properly? 
-          // actually standard loop is fine as long as we wait.
-          // But let's throw to trigger the loop continue
-          lastError = { status: 429, message: 'Rate limit exceeded' };
-          continue;
         }
 
-        throw new Error(`API error: ${response.status} - ${JSON.stringify(errorData)}`);
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.2,
+              maxOutputTokens: 4000,
+              topK: 40,
+              topP: 0.8,
+              responseMimeType: "application/json"
+            }
+          })
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+
+          if (response.status === 429) {
+            const retryAfter = response.headers.get('Retry-After');
+            const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt + 2) * 1000;
+
+            console.error('🚨 429 Rate Limit (Architecture)');
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            lastError = { status: 429, message: 'Rate limit exceeded' };
+            continue;
+          }
+
+          throw new Error(`API error: ${response.status} - ${JSON.stringify(errorData)}`);
+        }
+
+        const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+        if (!text) throw new Error('No content returned from API');
+
+        // Parse JSON
+        let diagramData: any;
+        try {
+          const jsonStr = text.replace(/^```json\s*/, '').replace(/```\s*$/, '').trim();
+          diagramData = JSON.parse(jsonStr);
+        } catch (e) {
+          console.error('Failed to parse Gemini JSON:', text);
+          throw new Error('AI returned invalid JSON');
+        }
+
+        const diagram = convertJsonToMermaid(diagramData);
+
+        // Save to Cache
+        try {
+          cacheService.set(cacheKey, diagram);
+        } catch (e) {
+          console.warn('Failed to cache diagram:', e);
+        }
+
+        return diagram;
+
+      } catch (error: any) {
+        console.error(`Attempt ${attempt + 1} failed:`, error);
+        lastError = error;
       }
-
-      const data = await response.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-      if (!text) throw new Error('No content returned from API');
-
-      // Parse JSON from response
-      let diagramData: any;
-      try {
-        // Clean markdown code blocks if present (though responseMimeType should prevent this)
-        const jsonStr = text.replace(/^```json\s*/, '').replace(/```\s*$/, '').trim();
-        diagramData = JSON.parse(jsonStr);
-      } catch (e) {
-        console.error('Failed to parse Gemini JSON:', text);
-        throw new Error('AI returned invalid JSON');
-      }
-
-      // Convert JSON to valid Mermaid
-      return convertJsonToMermaid(diagramData);
-
-    } catch (error: any) {
-      console.error(`Attempt ${attempt + 1} failed:`, error);
-      lastError = error;
-
-      // If it was a 429 that we already handled appropriately, we might want to continue.
-      // If it's a fatal error, maybe break? But for now, simple retry is safer.
     }
-  }
 
-  // If we're here, we failed. Check if it was a rate limit to give a better error.
-  if (lastError?.status === 429) {
-    // Return a special error string that ArchitectureDiagram.tsx can parse? 
-    // Or just throw a friendly error.
-    throw new Error('Rate limit exceeded. Please wait a moment and try again.');
-  }
+    // FALLBACK STRATEGY
+    // If we are here, all retries failed (including 429s).
+    // Instead of showing an error, show the Local Fallback Diagram.
+    console.warn('⚠️ All AI attempts failed. Generating local fallback diagram.');
+    return generateLocalArchitecture(repoStructure);
+  });
+};
 
-  throw lastError || new Error('Failed to generate diagram');
+export const extractArchitectureData = async (
+  repoName: string,
+  repoStructure: any,
+  analysis: CodebaseAnalysis,
+  apiKey: string
+): Promise<ArchitectureData> => {
+  const fileCount = JSON.stringify(repoStructure).match(/"type":"file"/g)?.length || 0;
+
+  // Serialize analysis for the prompt (limit size if needed)
+  const analysisSummary = analysis.files.map(f => {
+    return `File: ${f.file}
+    - Imports: ${f.imports.join(', ')}
+    - Hooks: ${f.hooks.join(', ')}
+    - API Calls: ${f.apiCalls.join(', ')}`;
+  }).join('\n\n').slice(0, 10000); // hard limit to avoid context overflow
+
+  const prompt = `You are a Senior Software Architect. Analyze the codebase structure and static analysis data to generate a structured architecture definition.
+
+CONTEXT:
+- Repository: ${repoName}
+- Files: ~${fileCount}
+- Static Analysis Data (Imports, Hooks, API Calls):
+${analysisSummary}
+
+INSTRUCTIONS:
+1. **Identify High-Level Modules**: specific functional blocks (e.g., "Auth Service", "User Context", "Payment Controller") that EXIST in the code.
+2. **Abstract UI Components**: Do NOT list individual UI atoms like "Button", "Input", "Header". Group them into a single "Presentation Layer" or "UI Components" node.
+3. **Determine Layers**: logical layers (e.g., "Presentation", "State Management", "Services", "Data", "External").
+4. **Map Relationships**: usage and dependencies based on the imports and calls provided.
+5. **Strict Grounding**: DO NOT INVENT COMPONENTS. Every component must correspond to a real file or directory visible in the "FILE STRUCTURE" or "Static Analysis Data". If it's not in the code, do not include it.
+6. **Strict JSON**: Return only valid JSON adhering to the schema.
+
+OUTPUT SCHEMA:
+{
+  "components": [
+    {
+      "id": "unique_snake_case_id",
+      "name": "Human Readable Name",
+      "type": "service|controller|model|view|utility|component|context|hook",
+      "layer": "presentation|state|services|data|infrastructure|external",
+      "responsibilities": ["list", "of", "responsibilities"]
+    }
+  ],
+  "relationships": [
+    {
+      "from": "component_id_a",
+      "to": "component_id_b",
+      "type": "calls|depends_on|imports|inherits|uses|provides",
+      "description": "context of relationship"
+    }
+  ],
+  "layers": ["Presentation", "Services", "Data"]
+}
+
+Constraints:
+- Generate comprehensive high-level architecture.
+- **Max 20 components**. Focus on the most important modules.
+- Ensure all IDs in relationships exist in components.
+- **NO HALLUCINATIONS**: Do not add databases, caches, or services unless you see code for them (e.g., a Redis client file).
+- Response must be pure JSON.
+`;
+
+  return callGeminiAPI(prompt, apiKey).then(res => {
+    // Check if the response implies a failure (rate limit, error message, etc)
+    if (res.content.trim().startsWith('⚠️') || res.content.includes('Rate Limit Exceeded')) {
+      console.warn('AI Generation prevented due to error:', res.content);
+      throw new Error(res.content); // Propagate the actual error message
+    }
+
+    try {
+      const jsonStr = res.content.replace(/^[\s\S]*?```json/g, '').replace(/```[\s\S]*?$/g, '').trim();
+      // Fallback cleanup if regex misses
+      const cleanJson = jsonStr.replace(/```/g, '');
+      return JSON.parse(cleanJson) as ArchitectureData;
+    } catch (e) {
+      console.error("JSON Parse Error in extractArchitectureData", e);
+      console.error("Raw AI Content:", res.content); // Log raw content for debugging
+      throw new Error("Failed to parse Architecture JSON. The AI might have returned invalid format.");
+    }
+  });
 };
 
 /**
@@ -508,144 +626,115 @@ const callGeminiAPI = async (prompt: string, apiKey: string): Promise<Explanatio
     throw new Error('Gemini API key is required');
   }
 
-  // Apply rate limiting
-  await waitForRateLimit();
+  // Wrap the entire API interaction in the queue
+  return rateLimiter.schedule(async () => {
+    const modelNames = [
+      'gemini-3-flash-preview',
+      'gemini-2.5-flash',
+    ];
 
-  // Use Gemini 2.5 Flash everywhere
-  const modelNames = [
-    'gemini-2.5-flash',
-  ];
+    let lastError: any = null;
+    const maxRetries = 2;
 
-  let lastError: any = null;
-  const maxRetries = 2;
+    for (const modelName of modelNames) {
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          if (attempt > 0) {
+            // ... existing retry backoff ... 
+            // Note: RateLimiter handles inter-request spacing, but *retries* might need their own wait 
+            // IF the failure wasn't a rate limit? 
+            // Actually, if we fail inside the schedule, we are holding the lock?
+            // Yes, 'await fn()' holds the queue.
+            const waitTime = Math.pow(2, attempt) * 1000;
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+          }
 
-  for (const modelName of modelNames) {
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      try {
-        if (attempt > 0) {
-          const waitTime = Math.pow(2, attempt) * 1000;
-          console.log(`Retry attempt ${attempt + 1}/${maxRetries} for ${modelName}, waiting ${waitTime}ms...`);
-          await new Promise(resolve => setTimeout(resolve, waitTime));
-        }
+          console.log(`Trying model: ${modelName} (attempt ${attempt + 1})`);
+          const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              contents: [{
+                parts: [{
+                  text: prompt
+                }]
+              }],
+              generationConfig: {
+                temperature: 0.7,
+                maxOutputTokens: 8192,
+                topK: 40,
+                topP: 0.95
+              }
+            })
+          });
 
-        console.log(`Trying model: ${modelName} (attempt ${attempt + 1})`);
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            contents: [{
-              parts: [{
-                text: prompt
-              }]
-            }],
-            generationConfig: {
-              temperature: 0.7,
-              maxOutputTokens: 2048,
-              topK: 40,
-              topP: 0.95
+          if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+
+            // Handle Rate Limits specifically
+            if (response.status === 429) {
+              console.error(`429 Rate Limit on ${modelName}`);
+              // If we hit 429 inside the serialized queue, it really means we are pushing too hard 
+              // OR quota is done.
+              // We should NOT hold the queue forever if we loop.
+              // But the loop is finite.
+              lastError = { status: 429, message: 'Rate limit / Quota exceeded', details: errorData };
+
+              // If specific retry-after?
+              const retryAfter = response.headers.get('Retry-After');
+              if (retryAfter) {
+                await new Promise(resolve => setTimeout(resolve, parseInt(retryAfter) * 1000));
+                continue; // Retry same model
+              }
+              // Else continue to next model? 
+              // Usually 429 applies to key, not model. But let's try.
+              break;
             }
-          })
-        });
 
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          console.error(`Model ${modelName} failed with status ${response.status}:`, errorData);
-
-          // Handle rate limiting with retry
-          if (response.status === 429) {
-            const retryAfter = response.headers.get('Retry-After');
-            const waitTime = retryAfter ? parseInt(retryAfter || '0') * 1000 : Math.pow(2, attempt + 2) * 1000;
-
-            console.error('🚨 Gemini API Rate Limit Hit!');
-            console.error(`Free tier limits: 15 requests/min, 1500 requests/day`);
-            console.error(`Wait time: ${Math.ceil(waitTime / 1000)} seconds`);
-
-            lastError = {
-              status: 429,
-              message: `Gemini API rate limit exceeded! Free tier: 15 requests/min, 1500/day. Wait ${Math.ceil(waitTime / 1000)}s. Consider: 1) Wait a minute 2) Use fewer AI features 3) Upgrade API tier`,
-              details: errorData
-            };
-
-            if (attempt < maxRetries - 1) {
-              console.log(`Rate limited, waiting ${waitTime}ms before retry...`);
-              await new Promise(resolve => setTimeout(resolve, waitTime));
-              continue;
-            }
-          } else {
+            console.error(`Model ${modelName} failed with status ${response.status}:`, errorData);
             lastError = errorData;
+            break; // Next model
           }
-          break; // Move to next model
-        }
 
-        const data = await response.json();
+          const data = await response.json();
+          // ... (validation logic) ...
+          const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
-        if (data.error) {
-          console.error(`Model ${modelName} returned error:`, data.error);
-          lastError = data.error;
-          break; // Move to next model
-        }
-
-        // Check response structure
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-        if (!text) {
-          console.error(`Model ${modelName} returned no text.`);
-          console.error('Finish reason:', data.candidates?.[0]?.finishReason);
-          console.error('Has candidates:', !!data.candidates);
-          console.error('Candidates length:', data.candidates?.length);
-
-          // Check if content was blocked
-          if (data.candidates?.[0]?.finishReason === 'SAFETY') {
-            lastError = 'Content blocked by safety filters';
-          } else if (data.candidates?.[0]?.finishReason === 'RECITATION') {
-            lastError = 'Content blocked due to recitation';
-          } else if (data.candidates?.[0]?.finishReason === 'MAX_TOKENS') {
-            lastError = 'Response too long, truncated';
-          } else if (data.candidates?.[0]?.finishReason) {
-            lastError = `Generation stopped: ${data.candidates[0].finishReason}`;
-          } else if (!data.candidates || data.candidates.length === 0) {
-            lastError = 'API returned empty candidates array - possible content filter';
-          } else {
-            lastError = 'No text in response - check console for details';
+          if (!text) {
+            // ... error handling ...
+            lastError = 'No text in response';
+            break;
           }
-          break; // Move to next model
-        }
 
-        console.log(`Successfully generated with model: ${modelName}`);
+          return {
+            content: text,
+            codeSnippets: extractCodeSnippets(text)
+          };
 
-        return {
-          content: text,
-          codeSnippets: extractCodeSnippets(text)
-        };
-      } catch (error) {
-        console.warn(`Model ${modelName} attempt ${attempt + 1} failed:`, error);
-        lastError = error;
-
-        if (attempt === maxRetries - 1) {
-          break; // Move to next model after all retries
+        } catch (error) {
+          console.warn(`Model ${modelName} attempt ${attempt + 1} failed:`, error);
+          lastError = error;
+          if (attempt === maxRetries - 1) break;
         }
       }
     }
-  }
 
-  // If all models failed, provide detailed error
-  const errorMessage = lastError ? JSON.stringify(lastError, null, 2) : 'Unknown error';
-  console.error('All models failed. Last error:', lastError);
+    // Fallback error
+    const errorMessage = lastError ? JSON.stringify(lastError, null, 2) : 'Unknown error';
+    if (lastError?.status === 429) {
+      return {
+        content: `⚠️ **Rate Limit Exceeded**\nPlease wait a moment. The Free Tier limit is strict (15 req/min). We are pacing requests, but you may have hit the daily quota.`,
+        codeSnippets: []
+      };
+    }
 
-  // Check if it's a rate limit error
-  if (lastError?.status === 429 || lastError?.message?.includes('rate limit')) {
     return {
-      content: `⚠️ **Gemini API Rate Limit Exceeded**\n\n**Free Tier Limits:**\n- 15 requests per minute\n- 1500 requests per day\n\n**What to do:**\n1. ⏳ Wait 60 seconds and try again\n2. 🔄 Reload the page to reset\n3. 📉 Use AI features sparingly\n4. 💰 Upgrade your API tier at [Google AI Studio](https://aistudio.google.com)\n\n**Tip:** The batch function explanation feature reduces API calls significantly!`,
+      content: `⚠️ Generation Failed.\nLast error: ${errorMessage}`,
       codeSnippets: []
     };
-  }
-
-  return {
-    content: `⚠️ Unable to generate AI explanation.\n\n**All API models failed.** Please check:\n\n- ✓ Your API key is valid and active\n- ✓ You have internet connection\n- ✓ The Gemini API is accessible from your location\n- ✓ Your API key has proper permissions\n\n**Models tried:** ${modelNames.join(', ')}\n\n**Last error:** ${errorMessage}\n\nTry refreshing the page or checking your API key at: https://aistudio.google.com/app/apikey`,
-    codeSnippets: []
-  };
+  });
 };
 
 

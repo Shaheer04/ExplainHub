@@ -2,8 +2,9 @@ import React, { useEffect, useRef, useState } from 'react';
 import mermaid from 'mermaid';
 import { useRepo } from '../contexts/RepoContext';
 import { useExplanations } from '../contexts/ExplanationContext';
-import { fetchCompleteRepoStructure } from '../services/githubApi';
-import { generateArchitectureDiagram } from '../services/geminiApi';
+import { fetchCompleteRepoStructure, fetchGitHubFileContent } from '../services/githubApi';
+import { architectureGenerator } from '../services/architectureGenerator';
+import { staticAnalysisService } from '../services/staticAnalysis';
 
 interface ArchitectureDiagramProps {
   apiKey: string;
@@ -15,6 +16,40 @@ const ArchitectureDiagram: React.FC<ArchitectureDiagramProps> = ({ apiKey }) => 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const diagramRef = useRef<HTMLDivElement>(null);
+
+  // Zoom & Pan State
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+
+  const handleWheel = (e: React.WheelEvent) => {
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      const scaleAmount = -e.deltaY * 0.001;
+      setZoom(z => Math.min(Math.max(0.1, z + scaleAmount), 5));
+    }
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    setIsDragging(true);
+    setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (isDragging) {
+      setPan({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
+    }
+  };
+
+  const handleMouseUp = () => {
+    setIsDragging(false);
+  };
+
+  const resetZoom = () => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  };
 
   useEffect(() => {
     mermaid.initialize({
@@ -51,25 +86,57 @@ const ArchitectureDiagram: React.FC<ArchitectureDiagramProps> = ({ apiKey }) => 
     setError(null);
 
     try {
-      // Fetch complete repo structure
+      // 1. Fetch complete repo structure
       console.log('ArchitectureDiagram: Starting diagram generation...');
-      console.log('ArchitectureDiagram: Repository:', `${repo.owner}/${repo.name}`);
-      console.log('ArchitectureDiagram: API Key present:', !!apiKey);
-
       const structure = await fetchCompleteRepoStructure(repo.owner, repo.name, '', 3, 0);
 
-      console.log('ArchitectureDiagram: Structure fetched successfully:', structure);
-
-      if (!structure) {
-        throw new Error('Failed to fetch repository structure - received null response');
-      }
-
-      if (!structure.children || structure.children.length === 0) {
+      if (!structure || !structure.children || structure.children.length === 0) {
         throw new Error('Repository appears to be empty or inaccessible');
       }
 
-      console.log('ArchitectureDiagram: Generating diagram with Gemini API...');
-      const diagram = await generateArchitectureDiagram(repo.name, structure, apiKey);
+      // 2. Identification of Key Files for Static Analysis
+      const keyFilesToAnalyze = ['package.json', 'tsconfig.json'];
+      const searchPaths = ['src/App.tsx', 'src/App.js', 'src/index.tsx', 'src/main.tsx', 'App.tsx', 'index.js'];
+
+      const filesToFetch: { name: string; url: string; path: string }[] = [];
+
+      // Helper to traverse and find files
+      const findFile = (node: any, path: string) => {
+        if (node.type === 'file') {
+          if (keyFilesToAnalyze.includes(node.name) || searchPaths.includes(node.path)) {
+            filesToFetch.push({ name: node.name, url: node.download_url, path: node.path });
+          }
+        } else if (node.children) {
+          node.children.forEach((child: any) => findFile(child, child.path));
+        }
+      };
+
+      findFile(structure, '');
+
+      // Limit to 5 files to avoid rate limits
+      const selectedFiles = filesToFetch.slice(0, 5);
+      console.log('Fetching content for analysis:', selectedFiles.map(f => f.path));
+
+      // 3. Fetch File Contents
+      const fileContents: Record<string, string> = {};
+      await Promise.all(selectedFiles.map(async (file) => {
+        if (file.url) {
+          try {
+            const content = await fetchGitHubFileContent(file.url);
+            fileContents[file.path] = content;
+          } catch (e) {
+            console.warn(`Failed to fetch content for ${file.path}`, e);
+          }
+        }
+      }));
+
+      // 4. Static Analysis
+      console.log('Running Static Analysis...');
+      const analysis = staticAnalysisService.analyzeCodebase(fileContents);
+
+      // 5. Generate Diagram via Architecture Service
+      console.log('Generating Architecture Diagram...');
+      const diagram = await architectureGenerator.generateDiagram(repo.name, structure, analysis, apiKey);
 
       console.log('ArchitectureDiagram: Diagram generated successfully');
       setArchitectureDiagram(diagram);
@@ -81,17 +148,15 @@ const ArchitectureDiagram: React.FC<ArchitectureDiagramProps> = ({ apiKey }) => 
       if (err instanceof Error) {
         errorMessage = err.message;
 
-        // Add helpful context for common errors
         if (err.message.includes('rate limit')) {
-          errorMessage += '\n\nTip: GitHub has a rate limit of 60 requests/hour for unauthenticated requests.';
-        } else if (err.message.includes('404') || err.message.includes('not found')) {
+          errorMessage += '\n\nTip: GitHub has a rate limit for unauthenticated requests.';
+        } else if (err.message.includes('404')) {
           errorMessage += '\n\nPlease verify the repository exists and is public.';
         } else if (err.message.includes('API key')) {
-          errorMessage += '\n\nCheck that your Gemini API key is valid at https://aistudio.google.com/app/apikey';
+          errorMessage += '\n\nCheck that your Gemini API key is valid.';
         }
       }
 
-      console.error('ArchitectureDiagram: Final error message:', errorMessage);
       setError(errorMessage);
     } finally {
       setLoading(false);
@@ -216,7 +281,7 @@ const ArchitectureDiagram: React.FC<ArchitectureDiagramProps> = ({ apiKey }) => 
           <div className="text-7xl mb-4 font-mono">[ ]</div>
           <p className="text-2xl font-bold text-github-dark-text mb-2">No Repository Loaded</p>
           <p className="text-github-dark-text-secondary">Load a repository first to generate its architecture</p>
-          <p className="text-github-dark-text-secondary text-sm mt-2 font-mono">// Load a repo using the form above</p>
+          <p className="text-github-dark-text-secondary text-sm mt-2 font-mono">{/* // Load a repo using the form above */}</p>
         </div>
       </div>
     );
@@ -324,12 +389,31 @@ const ArchitectureDiagram: React.FC<ArchitectureDiagramProps> = ({ apiKey }) => 
             </button>
           </div>
 
-          <div className="bg-github-dark-bg p-6 rounded-lg border border-github-dark-border overflow-auto">
+          <div className="bg-github-dark-bg p-6 rounded-lg border border-github-dark-border relative overflow-hidden h-[600px]">
+            {/* Controls */}
+            <div className="absolute top-4 right-4 flex flex-col gap-2 z-10">
+              <button onClick={() => setZoom(z => Math.min(z + 0.1, 5))} className="p-2 bg-gray-700 rounded text-white hover:bg-gray-600" title="Zoom In">+</button>
+              <button onClick={() => setZoom(z => Math.max(0.1, z - 0.1))} className="p-2 bg-gray-700 rounded text-white hover:bg-gray-600" title="Zoom Out">-</button>
+              <button onClick={resetZoom} className="p-2 bg-gray-700 rounded text-white hover:bg-gray-600" title="Reset">⟲</button>
+            </div>
+
             <div
-              ref={diagramRef}
-              className="mermaid-diagram flex justify-center"
-              style={{ minHeight: '400px' }}
-            />
+              className={`w-full h-full cursor-${isDragging ? 'grabbing' : 'grab'} overflow-hidden border border-gray-800 rounded bg-[#0d1117]`}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              onMouseLeave={handleMouseUp}
+              onWheel={handleWheel}
+            >
+              <div
+                ref={diagramRef}
+                className="mermaid-diagram origin-center transition-transform duration-75 ease-out"
+                style={{
+                  transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                  minHeight: '400px'
+                }}
+              />
+            </div>
           </div>
 
           <div className="bg-github-dark-bg-secondary p-4 rounded-lg border border-github-dark-border">

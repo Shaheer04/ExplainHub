@@ -95,7 +95,7 @@ const ExplanationDisplay: React.FC<ExplanationDisplayProps> = ({ apiKey }) => {
           <div className="mt-8 space-y-4">
             <div className="flex items-center gap-3 text-blue-300 text-sm font-medium animate-pulse">
               <div className="w-5 h-5 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></div>
-              Analyzing with Gemini 2.0 Flash...
+              Analyzing File...
             </div>
 
             <div className="space-y-3">

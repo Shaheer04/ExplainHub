@@ -4,7 +4,7 @@
 
 ExplainHub is an advanced AI-powered code analysis tool designed to help developers instantly understand complex repositories. By combining the reasoning capabilities of **Google Gemini 2.0** with static code analysis and interactive visualizations, ExplainHub transforms raw code into clear, actionable insights.
 
-![ExplainHub Demo](https://via.placeholder.com/1200x600?text=ExplainHub+Dashboard+Preview)
+![ExplainHub Demo](assets/preview.png)
 
 ## ✨ Key Features
 
